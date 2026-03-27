@@ -1,16 +1,21 @@
 package http
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"math"
-	"math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/god-hunter/god-hunter/internal/log"
 )
 
 type JitterProfile struct {
@@ -25,9 +30,15 @@ type Client struct {
 	jitter     *JitterProfile
 	userAgents []string
 	requestID  uint64
+	logger     *log.Logger
 }
 
 func NewClient(jitterRange string, proxyURL string) (*Client, error) {
+	return NewClientWithLogger(jitterRange, proxyURL, log.NewLogger(true))
+}
+
+// NewClientWithLogger creates a client with a custom logger
+func NewClientWithLogger(jitterRange string, proxyURL string, logger *log.Logger) (*Client, error) {
 	c := &Client{
 		jitter: &JitterProfile{
 			MinMs:    800,
@@ -42,6 +53,7 @@ func NewClient(jitterRange string, proxyURL string) (*Client, error) {
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
 		},
+		logger: logger,
 	}
 
 	// Parse jitter range
@@ -50,14 +62,16 @@ func NewClient(jitterRange string, proxyURL string) (*Client, error) {
 		if len(parts) == 2 {
 			minMs, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
 			maxMs, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
-			if minMs > 0 && maxMs > minMs {
+			if minMs >= 0 && maxMs > minMs {
 				c.jitter.MinMs = minMs
 				c.jitter.MaxMs = maxMs
+			} else {
+				logger.Warn("invalid jitter range, using defaults: %s", jitterRange)
 			}
 		}
 	}
 
-	// Configure HTTP transport
+	// Configure HTTP transport with proper connection pooling
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -66,17 +80,22 @@ func NewClient(jitterRange string, proxyURL string) (*Client, error) {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       10,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableKeepAlives:     false,
 	}
 
 	// Set proxy if provided
 	if proxyURL != "" {
-		proxyFunc := func(req *http.Request) (*url.URL, error) {
-			return url.Parse(proxyURL)
+		parsedProxyURL, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL: %w", err)
 		}
-		transport.Proxy = proxyFunc
+		transport.Proxy = http.ProxyURL(parsedProxyURL)
+		logger.Info("configured proxy: %s", proxyURL)
 	}
 
 	c.httpClient = &http.Client{
@@ -88,15 +107,29 @@ func NewClient(jitterRange string, proxyURL string) (*Client, error) {
 }
 
 func (c *Client) applyJitter() {
-	if !c.jitter.Enable {
+	if !c.jitter.Enable || c.jitter.MaxMs <= c.jitter.MinMs {
 		return
 	}
-	jitterMs := rand.Intn(c.jitter.MaxMs-c.jitter.MinMs) + c.jitter.MinMs
+	jitterRange := int64(c.jitter.MaxMs - c.jitter.MinMs)
+	randBig, err := rand.Int(rand.Reader, big.NewInt(jitterRange))
+	if err != nil {
+		c.logger.Warn("failed to generate jitter: %v", err)
+		return
+	}
+	jitterMs := c.jitter.MinMs + int(randBig.Int64())
 	time.Sleep(time.Duration(jitterMs) * time.Millisecond)
 }
 
 func (c *Client) getRandomUserAgent() string {
-	return c.userAgents[rand.Intn(len(c.userAgents))]
+	if len(c.userAgents) == 0 {
+		return "Mozilla/5.0"
+	}
+	randBig, err := rand.Int(rand.Reader, big.NewInt(int64(len(c.userAgents))))
+	if err != nil {
+		c.logger.Warn("failed to select user agent: %v", err)
+		return c.userAgents[0]
+	}
+	return c.userAgents[randBig.Int64()]
 }
 
 // RequestMetadata holds request and response details
@@ -108,15 +141,23 @@ type RequestMetadata struct {
 	ResponseStatus   int
 	ResponseHeaders  map[string]string
 	ResponseBody     string
+	ResponseBodySize int64
+	ContentType      string
 	TimingMs         int64
 	RequestID        string
+	Retries          int
 }
 
 // Do performs an HTTP request with jitter, rate limiting, and human-like behavior
-func (c *Client) Do(method, url string, headers map[string]string, body string) (*RequestMetadata, error) {
+func (c *Client) Do(method, urlStr string, headers map[string]string, body string) (*RequestMetadata, error) {
+	return c.DoWithContext(context.Background(), method, urlStr, headers, body)
+}
+
+// DoWithContext performs an HTTP request with context support
+func (c *Client) DoWithContext(ctx context.Context, method, urlStr string, headers map[string]string, body string) (*RequestMetadata, error) {
 	c.applyJitter()
 
-	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, strings.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -144,12 +185,19 @@ func (c *Client) Do(method, url string, headers map[string]string, body string) 
 	}
 	defer resp.Body.Close()
 
-	// Read response body
+	// Read response body with size limit
 	respBody := ""
+	contentType := resp.Header.Get("Content-Type")
+	bodySize := int64(0)
+
 	if resp.Body != nil {
-		buf := make([]byte, 1024*1024) // 1MB limit
-		n, _ := resp.Body.Read(buf)
-		respBody = string(buf[:n])
+		limitedReader := io.LimitedReader{R: resp.Body, N: 10 * 1024 * 1024} // 10MB limit
+		buf, err := io.ReadAll(&limitedReader)
+		if err != nil && err != io.EOF {
+			c.logger.Warn("error reading response body: %v", err)
+		}
+		respBody = string(buf)
+		bodySize = int64(len(buf))
 	}
 
 	// Serialize response headers
@@ -160,15 +208,18 @@ func (c *Client) Do(method, url string, headers map[string]string, body string) 
 
 	c.requestID++
 	return &RequestMetadata{
-		Method:          method,
-		URL:             url,
-		Headers:         headers,
-		Body:            body,
-		ResponseStatus:  resp.StatusCode,
-		ResponseHeaders: respHeaders,
-		ResponseBody:    respBody,
-		TimingMs:        duration.Milliseconds(),
-		RequestID:       fmt.Sprintf("req_%d", c.requestID),
+		Method:           method,
+		URL:              urlStr,
+		Headers:          headers,
+		Body:             body,
+		ResponseStatus:   resp.StatusCode,
+		ResponseHeaders:  respHeaders,
+		ResponseBody:     respBody,
+		ResponseBodySize: bodySize,
+		ContentType:      contentType,
+		TimingMs:         duration.Milliseconds(),
+		RequestID:        fmt.Sprintf("req_%d", c.requestID),
+		Retries:          0,
 	}, nil
 }
 
@@ -193,4 +244,32 @@ func (c *Client) CalculateDeviation(timings []int64) float64 {
 	}
 	variance := sumSquares / float64(len(timings))
 	return math.Sqrt(variance)
+}
+
+// Close gracefully closes the HTTP client and underlying connections
+func (c *Client) Close() error {
+	if c.httpClient != nil && c.httpClient.Transport != nil {
+		if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	c.logger.Debug("HTTP client connections closed")
+	return nil
+}
+
+// IsJSON checks if content type is JSON
+func IsJSON(contentType string) bool {
+	return strings.Contains(strings.ToLower(contentType), "application/json")
+}
+
+// IsHTML checks if content type is HTML
+func IsHTML(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+}
+
+// IsXML checks if content type is XML
+func IsXML(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	return strings.Contains(ct, "application/xml") || strings.Contains(ct, "text/xml")
 }

@@ -157,19 +157,19 @@ func (s *Store) GetSession(id string) (map[string]interface{}, error) {
 	defer s.mu.RUnlock()
 
 	row := s.db.QueryRow("SELECT id, created_at, status, target_domain, program_name, platform FROM sessions WHERE id = ?", id)
-	
+
 	var sessionID, createdAt, status, targetDomain, programName, platform string
 	if err := row.Scan(&sessionID, &createdAt, &status, &targetDomain, &programName, &platform); err != nil {
 		return nil, err
 	}
 
 	return map[string]interface{}{
-		"id":           sessionID,
-		"created_at":   createdAt,
-		"status":       status,
+		"id":            sessionID,
+		"created_at":    createdAt,
+		"status":        status,
 		"target_domain": targetDomain,
-		"program_name": programName,
-		"platform":     platform,
+		"program_name":  programName,
+		"platform":      platform,
 	}, nil
 }
 
@@ -184,7 +184,7 @@ func (s *Store) CreateChain(chainID, sessionID, name, description string) error 
 	return err
 }
 
-func (s *Store) StoreRequest(reqID, chainID string, sequence int, method, url, headers, body string, 
+func (s *Store) StoreRequest(reqID, chainID string, sequence int, method, url, headers, body string,
 	responseStatus int, responseHeaders, responseBody string, timingMs int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,7 +193,7 @@ func (s *Store) StoreRequest(reqID, chainID string, sequence int, method, url, h
 	          (id, chain_id, sequence_order, method, url, headers, body, 
 	           response_status, response_headers, response_body, timing_ms)
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	
+
 	_, err := s.db.Exec(query, reqID, chainID, sequence, method, url, headers, body,
 		responseStatus, responseHeaders, responseBody, timingMs)
 	return err
@@ -218,22 +218,22 @@ func (s *Store) GetChainRequests(chainID string) ([]map[string]interface{}, erro
 		var id, method, url, headers, body, respHeaders, respBody string
 		var seq, respStatus, timing int
 
-		if err := rows.Scan(&id, &seq, &method, &url, &headers, &body, 
+		if err := rows.Scan(&id, &seq, &method, &url, &headers, &body,
 			&respStatus, &respHeaders, &respBody, &timing); err != nil {
 			return nil, err
 		}
 
 		requests = append(requests, map[string]interface{}{
-			"id":                 id,
-			"sequence_order":     seq,
-			"method":             method,
-			"url":                url,
-			"headers":            headers,
-			"body":               body,
-			"response_status":    respStatus,
-			"response_headers":   respHeaders,
-			"response_body":      respBody,
-			"timing_ms":          timing,
+			"id":               id,
+			"sequence_order":   seq,
+			"method":           method,
+			"url":              url,
+			"headers":          headers,
+			"body":             body,
+			"response_status":  respStatus,
+			"response_headers": respHeaders,
+			"response_body":    respBody,
+			"timing_ms":        timing,
 		})
 	}
 
@@ -241,7 +241,7 @@ func (s *Store) GetChainRequests(chainID string) ([]map[string]interface{}, erro
 }
 
 // Finding operations
-func (s *Store) StoreFinding(findingID, sessionID, chainID, vulnType, severity, endpoint, parameter, 
+func (s *Store) StoreFinding(findingID, sessionID, chainID, vulnType, severity, endpoint, parameter,
 	description, evidence, pocPayload string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -250,7 +250,7 @@ func (s *Store) StoreFinding(findingID, sessionID, chainID, vulnType, severity, 
 	          (id, session_id, chain_id, vulnerability_type, severity, endpoint, parameter, 
 	           description, evidence, poc_payload)
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	
+
 	_, err := s.db.Exec(query, findingID, sessionID, chainID, vulnType, severity, endpoint,
 		parameter, description, evidence, pocPayload)
 	return err
@@ -273,25 +273,103 @@ func (s *Store) GetFindings(sessionID string) ([]map[string]interface{}, error) 
 	var findings []map[string]interface{}
 	for rows.Next() {
 		var id, vulnType, severity, endpoint, parameter, description, evidence, pocPayload, status, createdAt string
-		
+
 		if err := rows.Scan(&id, &vulnType, &severity, &endpoint, &parameter, &description,
 			&evidence, &pocPayload, &status, &createdAt); err != nil {
 			return nil, err
 		}
 
 		findings = append(findings, map[string]interface{}{
-			"id":                   id,
-			"vulnerability_type":   vulnType,
-			"severity":             severity,
-			"endpoint":             endpoint,
-			"parameter":            parameter,
-			"description":          description,
-			"evidence":             evidence,
-			"poc_payload":          pocPayload,
-			"status":               status,
-			"created_at":           createdAt,
+			"id":                 id,
+			"vulnerability_type": vulnType,
+			"severity":           severity,
+			"endpoint":           endpoint,
+			"parameter":          parameter,
+			"description":        description,
+			"evidence":           evidence,
+			"poc_payload":        pocPayload,
+			"status":             status,
+			"created_at":         createdAt,
 		})
 	}
 
 	return findings, rows.Err()
+}
+
+// GetChainsForSession retrieves all chains for a given session
+func (s *Store) GetChainsForSession(sessionID string) ([]map[string]interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT id, name, description, created_at, request_count 
+		FROM chains WHERE session_id = ? ORDER BY created_at DESC`,
+		sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chains []map[string]interface{}
+	for rows.Next() {
+		var id, name, description, createdAt string
+		var requestCount int
+
+		if err := rows.Scan(&id, &name, &description, &createdAt, &requestCount); err != nil {
+			return nil, err
+		}
+
+		chains = append(chains, map[string]interface{}{
+			"id":            id,
+			"name":          name,
+			"description":   description,
+			"created_at":    createdAt,
+			"request_count": requestCount,
+		})
+	}
+
+	return chains, rows.Err()
+}
+
+// GetRequestsForChain retrieves all requests in a chain
+func (s *Store) GetRequestsForChain(chainID string) ([]map[string]interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT id, method, url, headers, body, response_status, response_headers, 
+		       response_body, timing_ms, sequence_order, created_at
+		FROM requests WHERE chain_id = ? ORDER BY sequence_order ASC`,
+		chainID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var requests []map[string]interface{}
+	for rows.Next() {
+		var id, method, url, headers, body, respHeaders, respBody, createdAt string
+		var respStatus, timingMs, seqOrder int
+
+		if err := rows.Scan(&id, &method, &url, &headers, &body, &respStatus,
+			&respHeaders, &respBody, &timingMs, &seqOrder, &createdAt); err != nil {
+			return nil, err
+		}
+
+		requests = append(requests, map[string]interface{}{
+			"id":               id,
+			"method":           method,
+			"url":              url,
+			"headers":          headers,
+			"body":             body,
+			"response_status":  respStatus,
+			"response_headers": respHeaders,
+			"response_body":    respBody,
+			"timing_ms":        timingMs,
+			"sequence_order":   seqOrder,
+			"created_at":       createdAt,
+		})
+	}
+
+	return requests, rows.Err()
 }

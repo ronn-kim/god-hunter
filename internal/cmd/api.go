@@ -83,5 +83,20 @@ Examples:
 	raceCmd.Flags().Int("iterations", 100, "Number of test iterations")
 	apiCmd.AddCommand(raceCmd)
 
+	// :mutate action
+	mutateCmd := &cobra.Command{
+		Use:   "mutate",
+		Short: "Advanced mutation testing for vulnerability detection",
+		Long: `Perform sophisticated mutation testing on stored API chains
+to detect vulnerabilities via order variations, timing deviations,
+parameter mutations, and state inconsistencies.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return api.TestMutations(cmd.Context(), args, sessionName, silent)
+		},
+	}
+	mutateCmd.Flags().String("strategy", "all", "Mutation strategy: order|timing|param|state|race|all")
+	mutateCmd.Flags().Int("iterations", 1, "Number of mutation iterations")
+	apiCmd.AddCommand(mutateCmd)
+
 	return apiCmd
 }

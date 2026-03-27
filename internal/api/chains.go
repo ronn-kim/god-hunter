@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/god-hunter/god-hunter/internal/db"
 	httpengine "github.com/god-hunter/god-hunter/internal/http"
+	"github.com/god-hunter/god-hunter/internal/log"
 	"github.com/god-hunter/god-hunter/internal/session"
+	"github.com/god-hunter/god-hunter/internal/validation"
 )
 
 // Chain represents a sequence of API calls
@@ -41,11 +44,36 @@ type StoredRequest struct {
 
 // RecordChain intercepts and stores API call sequences
 func RecordChain(ctx context.Context, args []string, sessionName string, proxy string, silent bool) error {
+	logger := log.NewLogger(silent)
+
 	if len(args) == 0 {
 		return fmt.Errorf("target URL required: god-hunter api:record <url>")
 	}
 
 	targetURL := args[0]
+
+	// Validate input
+	validatedURL, err := validation.ValidateURL(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	targetURL = validatedURL
+
+	if sessionName != "" {
+		if err := validation.ValidateSessionName(sessionName); err != nil {
+			return fmt.Errorf("invalid session name: %w", err)
+		}
+	}
+
+	if proxy != "" {
+		validatedProxy, err := validation.ValidateProxy(proxy)
+		if err != nil {
+			return fmt.Errorf("invalid proxy: %w", err)
+		}
+		proxy = validatedProxy
+	}
+
+	logger.Info("initializing store for recording")
 
 	// Initialize store
 	store, err := db.NewStore()
@@ -59,16 +87,20 @@ func RecordChain(ctx context.Context, args []string, sessionName string, proxy s
 		sessionName = fmt.Sprintf("session_%d", time.Now().Unix())
 	}
 
+	logger.Info("creating session: %s", sessionName)
+
 	sess, err := session.NewSession(sessionName, extractDomain(targetURL), "", "", store)
 	if err != nil {
 		return fmt.Errorf("failed to create session: %w", err)
 	}
 
-	// Initialize HTTP client
-	client, err := httpengine.NewClient("800-2400", proxy)
+	// Initialize HTTP client with logger
+	logger.Info("initializing HTTP client with jitter")
+	client, err := httpengine.NewClientWithLogger("800-2400", proxy, logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize HTTP client: %w", err)
 	}
+	defer client.Close()
 
 	// Create chain
 	chainID := sess.GenerateChainID(targetURL)
@@ -78,8 +110,10 @@ func RecordChain(ctx context.Context, args []string, sessionName string, proxy s
 
 	// For demonstration, perform a single request and record it
 	// In a real scenario, this would intercept multiple requests from a proxy
-	metadata, err := client.Do("GET", targetURL, map[string]string{}, "")
+	logger.Info("recording request to %s", targetURL)
+	metadata, err := client.DoWithContext(ctx, "GET", targetURL, map[string]string{}, "")
 	if err != nil {
+		logger.Error("failed to record request: %v", err)
 		return fmt.Errorf("failed to record request: %w", err)
 	}
 
@@ -94,23 +128,32 @@ func RecordChain(ctx context.Context, args []string, sessionName string, proxy s
 		metadata.ResponseStatus, string(respHeadersJSON), metadata.ResponseBody,
 		int(metadata.TimingMs),
 	); err != nil {
+		logger.Error("failed to store request: %v", err)
 		return fmt.Errorf("failed to store request: %w", err)
 	}
 
-	if !silent {
-		fmt.Printf("[+] Recorded request to %s (Status: %d, Time: %dms)\n", targetURL, metadata.ResponseStatus, metadata.TimingMs)
-		fmt.Printf("[+] Chain ID: %s\n", chainID)
-		fmt.Printf("[+] Session ID: %s\n", sess.ID)
-	}
+	logger.Info("successfully recorded request (Status: %d, Time: %dms, Size: %d bytes)",
+		metadata.ResponseStatus, metadata.TimingMs, metadata.ResponseBodySize)
+	logger.Info("chain ID: %s", chainID)
+	logger.Info("session ID: %s", sess.ID)
 
 	return nil
 }
 
 // ReplayChain replays a chain with optional mutations
 func ReplayChain(ctx context.Context, sessionName string, silent bool) error {
+	logger := log.NewLogger(silent)
+
 	if sessionName == "" {
 		return fmt.Errorf("session name required: use --session flag")
 	}
+
+	// Validate session name
+	if err := validation.ValidateSessionName(sessionName); err != nil {
+		return fmt.Errorf("invalid session name: %w", err)
+	}
+
+	logger.Info("replaying chain for session: %s", sessionName)
 
 	// Initialize store
 	store, err := db.NewStore()
@@ -122,6 +165,7 @@ func ReplayChain(ctx context.Context, sessionName string, silent bool) error {
 	// Get session
 	sessData, err := store.GetSession(sessionName)
 	if err != nil || sessData == nil {
+		logger.Error("session not found: %s", sessionName)
 		return fmt.Errorf("session not found: %s", sessionName)
 	}
 
@@ -133,22 +177,39 @@ func ReplayChain(ctx context.Context, sessionName string, silent bool) error {
 		Status:       sessData["status"].(string),
 	}
 
+	logger.Info("found session: %s", sess.ID)
+	logger.Info("target: %s", sess.TargetDomain)
+
 	// For now, just confirm replay mode (would replay chains here)
-	if !silent {
-		fmt.Printf("[+] Replay mode for session: %s\n", sess.ID)
-		fmt.Printf("[+] Target: %s\n", sess.TargetDomain)
-	}
+	// TODO: Implement actual chain replay mechanism
 
 	return nil
 }
 
 // FuzzParameters performs parameter fuzzing on endpoints
 func FuzzParameters(ctx context.Context, args []string, sessionName string, silent bool) error {
+	logger := log.NewLogger(silent)
+
 	if len(args) == 0 {
 		return fmt.Errorf("target URL required: god-hunter api:fuzz <url>")
 	}
 
 	targetURL := args[0]
+
+	// Validate input
+	validatedURL, err := validation.ValidateURL(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	targetURL = validatedURL
+
+	if sessionName != "" {
+		if err := validation.ValidateSessionName(sessionName); err != nil {
+			return fmt.Errorf("invalid session name: %w", err)
+		}
+	}
+
+	logger.Info("initializing fuzzing session")
 
 	store, err := db.NewStore()
 	if err != nil {
@@ -165,38 +226,57 @@ func FuzzParameters(ctx context.Context, args []string, sessionName string, sile
 		return fmt.Errorf("failed to create session: %w", err)
 	}
 
-	client, err := httpengine.NewClient("800-2400", "")
+	logger.Info("creating HTTP client for fuzzing")
+	client, err := httpengine.NewClientWithLogger("800-2400", "", logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize HTTP client: %w", err)
 	}
+	defer client.Close()
 
 	// Generate fuzzing payloads
 	payloads := generateFuzzPayloads()
+	logger.Info("generated %d fuzzing payloads", len(payloads))
 
 	var verdicts []FuzzVerdict
+	var anomaliesFound int
+
 	for i, payload := range payloads {
-		fuzzedURL := targetURL
-		if strings.Contains(targetURL, "?") {
-			fuzzedURL += "&_fuzz=" + payload
-		} else {
-			fuzzedURL += "?_fuzz=" + payload
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			logger.Warn("fuzzing cancelled by context")
+			return ctx.Err()
+		default:
 		}
 
-		metadata, err := client.Do("GET", fuzzedURL, map[string]string{}, "")
+		fuzzedURL := targetURL
+		if strings.Contains(targetURL, "?") {
+			fuzzedURL += "&_fuzz=" + url.QueryEscape(payload)
+		} else {
+			fuzzedURL += "?_fuzz=" + url.QueryEscape(payload)
+		}
+
+		logger.Debug("testing payload [%d/%d]: %s", i+1, len(payloads), payload)
+
+		metadata, err := client.DoWithContext(ctx, "GET", fuzzedURL, map[string]string{}, "")
 		if err != nil {
+			logger.Warn("failed to fuzz with payload %s: %v", payload, err)
 			continue
 		}
 
+		isAnomaly := detectAnomaly(metadata.ResponseStatus)
 		verdicts = append(verdicts, FuzzVerdict{
 			PayloadIndex: i,
 			Payload:      payload,
 			ResponseCode: metadata.ResponseStatus,
 			ResponseTime: metadata.TimingMs,
-			Anomaly:      detectAnomaly(metadata.ResponseStatus),
+			Anomaly:      isAnomaly,
 		})
 
-		if !silent && detectAnomaly(metadata.ResponseStatus) {
-			fmt.Printf("[!] Anomaly detected with payload: %s (Status: %d)\n", payload, metadata.ResponseStatus)
+		if isAnomaly {
+			anomaliesFound++
+			logger.Warn("anomaly detected with payload: %s (Status: %d, Time: %dms)",
+				payload, metadata.ResponseStatus, metadata.TimingMs)
 		}
 	}
 
@@ -213,20 +293,35 @@ func FuzzParameters(ctx context.Context, args []string, sessionName string, sile
 		}
 	}
 
-	if !silent {
-		fmt.Printf("[+] Fuzzed %d payloads against %s\n", len(payloads), targetURL)
-	}
+	logger.Info("fuzzing complete: tested %d payloads, found %d anomalies", len(payloads), anomaliesFound)
 
 	return nil
 }
 
 // BuildChain builds a multi-step API sequence
 func BuildChain(ctx context.Context, args []string, sessionName string, silent bool) error {
+	logger := log.NewLogger(silent)
+
 	if len(args) == 0 {
 		return fmt.Errorf("target URL required: god-hunter api:chain <url>")
 	}
 
 	targetURL := args[0]
+
+	// Validate input
+	validatedURL, err := validation.ValidateURL(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	targetURL = validatedURL
+
+	if sessionName != "" {
+		if err := validation.ValidateSessionName(sessionName); err != nil {
+			return fmt.Errorf("invalid session name: %w", err)
+		}
+	}
+
+	logger.Info("building API chain for %s", targetURL)
 
 	store, err := db.NewStore()
 	if err != nil {
@@ -246,24 +341,40 @@ func BuildChain(ctx context.Context, args []string, sessionName string, silent b
 	// Create chain
 	chainID := sess.GenerateChainID(targetURL)
 	if err := store.CreateChain(chainID, sess.ID, "api_chain", "Multi-step API sequence"); err != nil {
+		logger.Error("failed to create chain: %v", err)
 		return fmt.Errorf("failed to create chain: %w", err)
 	}
 
-	if !silent {
-		fmt.Printf("[+] Created chain: %s\n", chainID)
-		fmt.Printf("[+] Session: %s\n", sess.ID)
-	}
+	logger.Info("created chain: %s", chainID)
+	logger.Info("session: %s", sess.ID)
 
 	return nil
 }
 
 // RaceDetection detects race conditions in API endpoints
 func RaceDetection(ctx context.Context, args []string, sessionName string, silent bool) error {
+	logger := log.NewLogger(silent)
+
 	if len(args) == 0 {
 		return fmt.Errorf("target URL required: god-hunter api:race <url>")
 	}
 
 	targetURL := args[0]
+
+	// Validate input
+	validatedURL, err := validation.ValidateURL(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	targetURL = validatedURL
+
+	if sessionName != "" {
+		if err := validation.ValidateSessionName(sessionName); err != nil {
+			return fmt.Errorf("invalid session name: %w", err)
+		}
+	}
+
+	logger.Info("initializing race condition detection")
 
 	store, err := db.NewStore()
 	if err != nil {
@@ -280,10 +391,12 @@ func RaceDetection(ctx context.Context, args []string, sessionName string, silen
 		return fmt.Errorf("failed to create session: %w", err)
 	}
 
-	client, err := httpengine.NewClient("0-100", "") // Minimal jitter for race testing
+	logger.Info("creating HTTP client with minimal jitter for race testing")
+	client, err := httpengine.NewClientWithLogger("0-100", "", logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize HTTP client: %w", err)
 	}
+	defer client.Close()
 
 	// Race condition detection: concurrent requests to same endpoint
 	concurrency := 10
@@ -292,19 +405,30 @@ func RaceDetection(ctx context.Context, args []string, sessionName string, silen
 	statuses := make([]int32, concurrency*iterations)
 	var idx int64
 
-	if !silent {
-		fmt.Printf("[+] Starting race condition detection (%d concurrent × %d iterations)\n", concurrency, iterations)
-	}
+	logger.Info("starting race condition detection (%d concurrent × %d iterations)", concurrency, iterations)
 
 	for iter := 0; iter < iterations; iter++ {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			logger.Warn("race detection cancelled by context")
+			return ctx.Err()
+		default:
+		}
+
+		if iter%10 == 0 {
+			logger.Debug("completed %d iterations", iter)
+		}
+
 		var wg sync.WaitGroup
 		wg.Add(concurrency)
 
 		for i := 0; i < concurrency; i++ {
 			go func(id int) {
 				defer wg.Done()
-				metadata, err := client.Do("GET", targetURL, map[string]string{}, "")
+				metadata, err := client.DoWithContext(ctx, "GET", targetURL, map[string]string{}, "")
 				if err != nil {
+					logger.Debug("request failed in goroutine %d: %v", id, err)
 					return
 				}
 
@@ -317,12 +441,24 @@ func RaceDetection(ctx context.Context, args []string, sessionName string, silen
 		wg.Wait()
 	}
 
+	logger.Info("completed %d concurrent requests, analyzing results", idx)
+
 	// Analyze results for anomalies
 	var raceVulns []string
-	for i := 1; i < int(idx); i++ {
-		if statuses[i] != statuses[i-1] {
+	statusVariance := make(map[int32]int)
+
+	for i := 0; i < int(idx); i++ {
+		statusVariance[statuses[i]]++
+
+		if i > 0 && statuses[i] != statuses[i-1] {
 			raceVulns = append(raceVulns, fmt.Sprintf("Status code variance: %d vs %d", statuses[i], statuses[i-1]))
 		}
+	}
+
+	// Log status code distribution
+	logger.Info("status code distribution:")
+	for code, count := range statusVariance {
+		logger.Info("  Status %d: %d requests (%.1f%%)", code, count, float64(count)*100/float64(idx))
 	}
 
 	if len(raceVulns) > 0 {
@@ -335,14 +471,12 @@ func RaceDetection(ctx context.Context, args []string, sessionName string, silen
 			"Send concurrent requests to trigger state inconsistency",
 		)
 
-		if !silent {
-			fmt.Printf("[!] Potential race condition detected: %s\n", desc)
-		}
+		logger.Warn("potential race condition detected: %s", desc)
+	} else {
+		logger.Info("no race conditions detected in %d requests", idx)
 	}
 
-	if !silent {
-		fmt.Printf("[+] Completed race detection (%d total requests)\n", idx)
-	}
+	logger.Info("race detection complete (%d total requests)", idx)
 
 	return nil
 }
